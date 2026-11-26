@@ -59,6 +59,54 @@ async function scanSftpRecursive(sftp, dirPath, fileList = []) {
   return fileList;
 }
 
+// Recursive delete helper for FTP (removes files and subdirectories)
+async function deleteFtpRecursive(client, targetPath, isDirectoryHint = null) {
+  const cleanPath = targetPath === '/' ? '/' : targetPath.replace(/\/+$/, '');
+  if (cleanPath === '/') {
+    throw new Error('Refusing to delete root directory /');
+  }
+
+  let isDir = isDirectoryHint;
+  if (isDir === null || isDir === undefined) {
+    const parentDir = cleanPath.includes('/') ? (cleanPath.slice(0, cleanPath.lastIndexOf('/')) || '/') : '/';
+    const baseName = cleanPath.split('/').pop();
+    const siblings = await client.list(parentDir);
+    const match = siblings.find(entry => entry.name === baseName);
+    if (!match) {
+      throw new Error(`Target not found: ${cleanPath}`);
+    }
+    isDir = Boolean(match.isDirectory);
+  }
+
+  if (!isDir) {
+    await client.remove(cleanPath);
+    return;
+  }
+
+  const entries = await client.list(cleanPath);
+  for (const entry of entries) {
+    if (entry.name === '.' || entry.name === '..') continue;
+    const childPath = `${cleanPath}/${entry.name}`;
+    await deleteFtpRecursive(client, childPath, Boolean(entry.isDirectory));
+  }
+  await client.removeDir(cleanPath);
+}
+
+// Recursive delete helper for SFTP (removes files and subdirectories)
+async function deleteSftpRecursive(sftp, targetPath) {
+  const cleanPath = targetPath === '/' ? '/' : targetPath.replace(/\/+$/, '');
+  if (cleanPath === '/') {
+    throw new Error('Refusing to delete root directory /');
+  }
+
+  const stat = await sftp.stat(cleanPath);
+  if (stat.isDirectory) {
+    await sftp.rmdir(cleanPath, true);
+  } else {
+    await sftp.delete(cleanPath);
+  }
+}
+
 module.exports = async function handler(req, res) {
   // Enable CORS for frontend access
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -81,7 +129,11 @@ module.exports = async function handler(req, res) {
     user,
     password,
     path: targetPath = '/',
-    files = [] // Used for batch zip download
+    newPath,
+    mode,
+    itemType,
+    content = '',
+    files = []
   } = req.body || {};
 
   if (!host || !user) {
@@ -145,7 +197,118 @@ module.exports = async function handler(req, res) {
     }
 
     // ==========================================
-    // 3. DOWNLOAD SINGLE FILE
+    // 3. CREATE DIRECTORY (MKDIR)
+    // ==========================================
+    if (action === 'mkdir') {
+      if (protocol === 'sftp') {
+        sftpClient = await connectSFTP({ host, port, user, password });
+        await sftpClient.mkdir(targetPath, true);
+        await sftpClient.end();
+      } else {
+        ftpClient = await connectFTP({ host, port, user, password, secure: protocol === 'ftps' });
+        await ftpClient.ensureDir(targetPath);
+        ftpClient.close();
+      }
+      return res.status(200).json({ success: true, path: targetPath });
+    }
+
+    // ==========================================
+    // 4. CREATE / OVERWRITE FILE (WRITE)
+    // ==========================================
+    if (action === 'write') {
+      const contentBuffer = Buffer.from(String(content ?? ''), 'utf8');
+      const parentDir = targetPath.includes('/')
+        ? (targetPath.slice(0, targetPath.lastIndexOf('/')) || '/')
+        : '/';
+
+      if (protocol === 'sftp') {
+        sftpClient = await connectSFTP({ host, port, user, password });
+        if (parentDir && parentDir !== '/') {
+          await sftpClient.mkdir(parentDir, true);
+        }
+        await sftpClient.put(contentBuffer, targetPath);
+        await sftpClient.end();
+      } else {
+        ftpClient = await connectFTP({ host, port, user, password, secure: protocol === 'ftps' });
+        if (parentDir && parentDir !== '/') {
+          await ftpClient.ensureDir(parentDir);
+        }
+        const readableStream = new PassThrough();
+        readableStream.end(contentBuffer);
+        await ftpClient.uploadFrom(readableStream, targetPath);
+        ftpClient.close();
+      }
+      return res.status(200).json({ success: true, path: targetPath, bytes: contentBuffer.length });
+    }
+
+    // ==========================================
+    // 5. DELETE FILE OR FOLDER RECURSIVELY
+    // ==========================================
+    if (action === 'delete') {
+      if (!targetPath || targetPath === '/') {
+        return res.status(400).json({ success: false, error: 'Valid target path is required for delete' });
+      }
+
+      if (protocol === 'sftp') {
+        sftpClient = await connectSFTP({ host, port, user, password });
+        await deleteSftpRecursive(sftpClient, targetPath);
+        await sftpClient.end();
+      } else {
+        ftpClient = await connectFTP({ host, port, user, password, secure: protocol === 'ftps' });
+        const dirHint = itemType === 'folder' ? true : (itemType === 'file' ? false : null);
+        await deleteFtpRecursive(ftpClient, targetPath, dirHint);
+        ftpClient.close();
+      }
+      return res.status(200).json({ success: true, deleted: targetPath });
+    }
+
+    // ==========================================
+    // 6. RENAME OR MOVE FILE / FOLDER
+    // ==========================================
+    if (action === 'rename') {
+      if (!targetPath || !newPath) {
+        return res.status(400).json({ success: false, error: 'Both path and newPath are required for rename' });
+      }
+
+      if (protocol === 'sftp') {
+        sftpClient = await connectSFTP({ host, port, user, password });
+        await sftpClient.rename(targetPath, newPath);
+        await sftpClient.end();
+      } else {
+        ftpClient = await connectFTP({ host, port, user, password, secure: protocol === 'ftps' });
+        await ftpClient.rename(targetPath, newPath);
+        ftpClient.close();
+      }
+      return res.status(200).json({ success: true, from: targetPath, to: newPath });
+    }
+
+    // ==========================================
+    // 7. CHANGE PERMISSIONS (CHMOD)
+    // ==========================================
+    if (action === 'chmod') {
+      if (!targetPath || !mode) {
+        return res.status(400).json({ success: false, error: 'Both path and mode (e.g. "0755" or "0644") are required' });
+      }
+      const octalString = String(mode).replace(/^0+/, '') || '644';
+      const numericMode = parseInt(octalString, 8);
+      if (Number.isNaN(numericMode)) {
+        return res.status(400).json({ success: false, error: 'Invalid octal permission mode' });
+      }
+
+      if (protocol === 'sftp') {
+        sftpClient = await connectSFTP({ host, port, user, password });
+        await sftpClient.chmod(targetPath, numericMode);
+        await sftpClient.end();
+      } else {
+        ftpClient = await connectFTP({ host, port, user, password, secure: protocol === 'ftps' });
+        await ftpClient.send(`SITE CHMOD ${octalString} ${targetPath}`);
+        ftpClient.close();
+      }
+      return res.status(200).json({ success: true, path: targetPath, mode: `0${octalString}` });
+    }
+
+    // ==========================================
+    // 8. DOWNLOAD SINGLE FILE
     // ==========================================
     if (action === 'download') {
       const fileName = targetPath.split('/').pop() || 'download.bin';
@@ -169,7 +332,7 @@ module.exports = async function handler(req, res) {
     }
 
     // ==========================================
-    // 4. DOWNLOAD ALL (OR BATCH) AS ZIP
+    // 9. DOWNLOAD ALL (OR BATCH) AS ZIP
     // ==========================================
     if (action === 'zip') {
       res.setHeader('Content-Type', 'application/zip');
@@ -207,6 +370,6 @@ module.exports = async function handler(req, res) {
   } catch (err) {
     if (ftpClient) try { ftpClient.close(); } catch (_) {}
     if (sftpClient) try { await sftpClient.end(); } catch (_) {}
-    return res.status(500).json({ success: false, error: err.message || 'FTP Connection Failed' });
+    return res.status(500).json({ success: false, error: err.message || 'FTP Operation Failed' });
   }
 };
